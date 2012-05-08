@@ -8,7 +8,7 @@ import itertools
 
 BINARY_PATH = "cached/binary/"
 MM_PATH = "cached/mm/"
-
+WEEK_LENGTH = 60 * 60 * 24 * 7 # (in seconds)
 
 ### Measures ###
 
@@ -27,7 +27,9 @@ def rmse(theta1, theta2):
     -------
     loss : float
     """
-    return np.sqrt(mean_squared_error(theta1, theta2))
+    diff = theta1 - theta2
+    diff.data **=2
+    return np.sqrt(diff.sum() / diff.shape[1])
 
 
 ### I/O Functions ###
@@ -38,7 +40,7 @@ def read_binary(chart_type, unix_timestamp, norm=None):
         write_binary(chart_type, unix_timestamp)
     try:
         mat = io.loadmat(fname)["listen_matrix"].tocsr().astype("f8")
-    # Hack to get around bug loading matrices with no entries
+    # Hack to get around bug loading matlab matrices with no entries
     except ValueError:
         mm_fname = "%s%s/%d.mm" % (MM_PATH, chart_type, unix_timestamp)
         mat = io.mmread(mm_fname).tocsr().astype("d4")
@@ -68,46 +70,25 @@ def load_all(chart_type, norm=None):
 
 ### Functions for selecting velocities from valid weeks ###
 
-def get_intervals(chart_type, norm="l1"):
+def velocities_dict(chart_type, norm="l1"):
+    # A valid week is one with at least 60% of the median activity level
+    week_dict_raw = load_all(chart_type)
+    week_dict_norm = load_all(chart_type, norm=norm)
+    median_num_listens = np.median([mat.sum() for mat in week_dict_raw.values()])
+    accepted_weeks = filter(lambda w: week_dict_raw[w].sum() > median_num_listens * 0.6, sorted(week_dict_raw.keys()))
+    adjacent_accepted_weeks = [(w1, w2) for w1, w2 in pairwise(accepted_weeks) if (w2 - w1) == WEEK_LENGTH]
+    return dict([((w1, w2), week_dict_norm[w2] - week_dict_norm[w1]) for w1, w2 in adjacent_accepted_weeks])
 
-    valid_week_indicator = mark_valid_weeks(chart_type)
-
-    # Group contiguous blocks of valid weeks
-    intervals = []
-    current_interval = []
-    for week in sorted(valid_week_indicator.keys()):
-        if valid_week_indicator[week]:
-            current_interval.append(week)
-        else:
-            if len(current_interval) > 0:
-                intervals.append(current_interval)
-                current_interval = []
-    if len(current_interval) > 0:
-        intervals.append(current_interval)
-
-    
-    return intervals
-
-def valid_velocities(chart_type, norm="l1"):
-    intervals = get_intervals(chart_type, norm)
-    normalized_matrices = load_all(chart_type, norm)
-    for interval in intervals:
-        for p1, p2 in pairwise(interval):
-            vel_mat = normalized_matrices[p2] - normalized_matrices[p1]
-            yield (p1, p2), vel_mat
-    
-def mark_valid_weeks(chart_type):
-    """
-    A week is considered valid if it has more global listens than
-    half of the median number of global listens.
-    """
-    week_dict = load_all(chart_type)
-    median_num_listens = np.median([mat.sum() for mat in  week_dict.values()])
-    missing_dict = {}
-    for unix_timestamp in sorted(week_dict.keys()):
-        mat = week_dict[unix_timestamp]
-        missing_dict[unix_timestamp] = mat.sum() > (median_num_listens * 0.60)
-    return missing_dict
+def split_current_past(velocities_dict, lag_timesteps):
+    # generator that produces (current, (oldest, newer, ..., last_before_current))
+    weeks = sorted(velocities_dict.keys(), key=lambda tup: tup[0])
+    l, r = 0, lag_timesteps
+    while r < len(weeks):
+        expected_r = weeks[l][0] + WEEK_LENGTH * lag_timesteps
+        if weeks[r][0] == expected_r:
+            yield weeks[r], weeks[l:r]
+        l += 1
+        r += 1
 
 def pairwise(iterable):
     "s -> (s0,s1), (s1,s2), (s2, s3), ..."
